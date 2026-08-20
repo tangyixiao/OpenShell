@@ -362,6 +362,12 @@ server:
   # from this Secret instead of using dbUrl. The Secret must contain a
   # `uri` key, e.g. postgresql://user:pass@host:5432/dbname.
   externalDbSecret: ""
+  # -- Connection ceiling for the gateway's database pool, shared by every
+  # database-backed request. 0 (default) uses the gateway's backend default:
+  # 10 for PostgreSQL, 5 for on-disk SQLite. On PostgreSQL each replica opens
+  # its own pool, so keep dbMaxConnections * replicaCount below the server's
+  # own max_connections.
+  dbMaxConnections: 0
   # -- Image pull secrets attached to sandbox pods. Referenced Secrets must exist
   # in the sandbox namespace.
   sandboxImagePullSecrets: []
