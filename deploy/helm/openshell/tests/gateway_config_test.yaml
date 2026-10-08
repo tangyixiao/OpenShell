@@ -846,6 +846,30 @@ tests:
       - failedTemplate:
           errorMessage: "server.dbMaxConnections must not be negative; set 0 to use the gateway default"
 
+  - it: omits the mutation lock pool ceiling by default so the gateway keeps its own default
+    template: templates/gateway-config.yaml
+    asserts:
+      - notMatchRegex:
+          path: data["gateway.toml"]
+          pattern: 'database_lock_max_connections\s*='
+
+  - it: renders the mutation lock pool ceiling under [openshell.gateway] when set
+    template: templates/gateway-config.yaml
+    set:
+      server.dbLockMaxConnections: 8
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\].*?database_lock_max_connections\s*=\s*8'
+
+  - it: fails to render when dbLockMaxConnections is negative
+    template: templates/statefulset.yaml
+    set:
+      server.dbLockMaxConnections: -1
+    asserts:
+      - failedTemplate:
+          errorMessage: "server.dbLockMaxConnections must not be negative; set 0 to use the gateway default"
+
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
     set:
