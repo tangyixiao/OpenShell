@@ -82,6 +82,11 @@ mod linux {
     const MAX_CONTROL_CONNECTIONS: usize = 128;
     const MAX_REPLAY_LEDGER_ENTRIES: usize = 4096;
     const MAX_RETAINED_EXEC_PROCESSES: usize = 64;
+    // Three stdio pipes require six descriptors before fork, and Rust's
+    // process launcher may briefly need additional bookkeeping descriptors.
+    // Reclaim closed mediated sockets before each serialized spawn so stale
+    // socket sources cannot consume that bounded launch budget.
+    const EXEC_SPAWN_DESCRIPTOR_HEADROOM: usize = 16;
 
     // NVML may traverse the persistenced socket directory during initialization;
     // WSL2 supplies GPU libraries under /usr/lib/wsl and the /dev/dxg device.
@@ -206,14 +211,7 @@ mod linux {
         std::fs::remove_file(config_path).map_err(|error| {
             format!("consume boundary config {}: {error}", config_path.display())
         })?;
-        let child_env = serde_json::to_string(&config.child_env)
-            .map_err(|error| format!("encode boundary workload environment: {error}"))?;
-        // This runs before the Tokio runtime or control threads exist. The process
-        // supervisor consumes the serialized map and applies values only to
-        // workload children.
-        unsafe {
-            std::env::set_var(openshell_core::sandbox_env::USER_ENVIRONMENT, child_env);
-        }
+        crate::process::install_boundary_user_environment(config.child_env.clone())?;
         crate::sandbox::apply_supervisor_startup_hardening()
             .map_err(|error| format!("install sandbox process prelude: {error}"))?;
         // Keep orphaned workload descendants in this process tree so
@@ -225,7 +223,7 @@ mod linux {
         }
         crate::managed_children::start_orphan_reaper()
             .map_err(|error| format!("start sandbox orphan reaper: {error}"))?;
-        let (launcher, listener) = openshell_isolation_interface::linux::workload_launcher::start()
+        let (launcher, listener) = crate::linux::workload_launcher::start()
             .map_err(|error| format!("start sandbox workload launcher: {error}"))?;
         let protected_control_port = match &config.listener {
             BoundaryListenerConfig::TlsTcp { address, .. } => Some(address.port()),
@@ -248,32 +246,19 @@ mod linux {
     }
 
     fn make_boundary_nondumpable() -> Result<(), String> {
-        // SAFETY: PR_SET_DUMPABLE accepts one scalar flag. The sandbox keeps
-        // bootstrap and protected-channel keys in memory after this point.
-        if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) } == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "make sandbox process nondumpable: {}",
-                io::Error::last_os_error()
-            ))
-        }
+        rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable)
+            .map_err(|error| format!("make sandbox process nondumpable: {error}"))
     }
 
     fn disable_core_dumps() -> Result<(), String> {
-        let limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: `limit` is a valid immutable rlimit value.
-        if unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const limit) } == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "disable sandbox core dumps: {}",
-                io::Error::last_os_error()
-            ))
-        }
+        rustix::process::setrlimit(
+            rustix::process::Resource::Core,
+            rustix::process::Rlimit {
+                current: Some(0),
+                maximum: Some(0),
+            },
+        )
+        .map_err(|error| format!("disable sandbox core dumps: {error}"))
     }
 
     fn install_boundary_signal_handlers() -> Result<(), String> {
@@ -455,63 +440,27 @@ mod linux {
         expected: &ResolvedWorkloadIdentity,
         allow_runtime_supplementary_groups: bool,
     ) -> Result<(), String> {
-        let mut real_uid = 0;
-        let mut effective_uid = 0;
-        let mut saved_uid = 0;
-        let mut real_gid = 0;
-        let mut effective_gid = 0;
-        let mut saved_gid = 0;
-        // SAFETY: all pointers refer to live scalar output storage.
-        if unsafe {
-            libc::getresuid(
-                &raw mut real_uid,
-                &raw mut effective_uid,
-                &raw mut saved_uid,
-            )
-        } != 0
-            || unsafe {
-                libc::getresgid(
-                    &raw mut real_gid,
-                    &raw mut effective_gid,
-                    &raw mut saved_gid,
-                )
-            } != 0
-        {
-            return Err(format!(
-                "measure sandbox identity: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        if [real_uid, effective_uid, saved_uid]
+        let uid = nix::unistd::getresuid()
+            .map_err(|error| format!("measure sandbox identity: {error}"))?;
+        let gid = nix::unistd::getresgid()
+            .map_err(|error| format!("measure sandbox identity: {error}"))?;
+        if [uid.real, uid.effective, uid.saved]
             .iter()
-            .any(|uid| *uid != expected.uid)
-            || [real_gid, effective_gid, saved_gid]
+            .any(|uid| uid.as_raw() != expected.uid)
+            || [gid.real, gid.effective, gid.saved]
                 .iter()
-                .any(|gid| *gid != expected.gid)
+                .any(|gid| gid.as_raw() != expected.gid)
         {
             return Err(format!(
                 "sandbox identity does not match resolved workload {}:{}",
                 expected.uid, expected.gid
             ));
         }
-        // SAFETY: a null buffer with size zero queries the group count.
-        let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-        if count < 0 {
-            return Err(format!(
-                "measure sandbox supplementary groups: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        let mut groups = vec![0_u32; usize::try_from(count).unwrap_or(0)];
-        if count > 0 {
-            // SAFETY: groups has capacity for exactly `count` gid_t values.
-            if unsafe { libc::getgroups(count, groups.as_mut_ptr()) } != count {
-                return Err(format!(
-                    "read sandbox supplementary groups: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-        }
+        let groups = nix::unistd::getgroups()
+            .map_err(|error| format!("read sandbox supplementary groups: {error}"))?
+            .into_iter()
+            .map(nix::unistd::Gid::as_raw)
+            .collect();
         let groups = normalized_supplementary_groups(groups, expected.gid);
         if !supplementary_groups_match(
             &groups,
@@ -1382,8 +1331,7 @@ mod linux {
         exec_requests: Mutex<ExecRequestLedger>,
         replay_ledger: Mutex<ReplayLedger>,
         network_broker: NetworkBroker,
-        workload_launcher:
-            openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+        workload_launcher: crate::linux::workload_launcher::WorkloadLauncher,
         qualification: crate::RuntimeQualification,
     }
 
@@ -1396,6 +1344,29 @@ mod linux {
         session: Arc<MainSession>,
         attached: Arc<AtomicBool>,
         status: Arc<Mutex<Option<ExitStatusWire>>>,
+    }
+
+    async fn retain_exec_completion(
+        process: Arc<dyn BoundaryProcess>,
+        session: Arc<MainSession>,
+        status: Arc<Mutex<Option<ExitStatusWire>>>,
+    ) {
+        let exit_status = match process.wait().await {
+            Ok(exit_status) => ExitStatusWire::from(exit_status),
+            Err(error) => {
+                // A process wait error is terminal per the BoundaryProcess
+                // contract. Retaining `None` here makes this handle look live
+                // forever and can permanently exhaust exec admission.
+                tracing::warn!(%error, "Exec process wait failed; recording terminal status");
+                ExitStatusWire::Exited(74)
+            }
+        };
+        *lock(&status) = Some(exit_status);
+        let exit_code = match exit_status {
+            ExitStatusWire::Exited(code) => code,
+            ExitStatusWire::Signaled(signal) => 128 + signal,
+        };
+        let _ = session.finish_remote(exit_code, false).await;
     }
 
     #[derive(Default)]
@@ -1606,7 +1577,7 @@ mod linux {
             config: BoundaryConfig,
             process_runtime: tokio::runtime::Handle,
             network_broker: NetworkBroker,
-            workload_launcher: openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+            workload_launcher: crate::linux::workload_launcher::WorkloadLauncher,
             qualification: crate::RuntimeQualification,
         ) -> Result<Self, String> {
             let sandbox_id = SandboxId::parse(config.boundary_id.clone())
@@ -2162,6 +2133,14 @@ mod linux {
             }
             requests.reserve(request_id, expires_at)?;
             drop(requests);
+            self.network_broker
+                .ensure_descriptor_headroom(EXEC_SPAWN_DESCRIPTOR_HEADROOM)
+                .map_err(|error| {
+                    guest_error(
+                        BoundaryErrorKind::Unavailable,
+                        format!("exec descriptor headroom unavailable: {error}"),
+                    )
+                })?;
             let session = self
                 .process_runtime
                 .block_on(executor.exec(spec.into()))
@@ -2202,18 +2181,7 @@ mod linux {
             let wait_session = retained.clone();
             let wait_status = status.clone();
             self.process_runtime.spawn(async move {
-                if let Ok(exit_status) = wait_process.wait().await {
-                    *lock(&wait_status) = Some(ExitStatusWire::from(exit_status));
-                    let exit_code = match exit_status {
-                        openshell_isolation_interface::contract::BoundaryExitStatus::Exited(
-                            code,
-                        ) => code,
-                        openshell_isolation_interface::contract::BoundaryExitStatus::Signaled(
-                            signal,
-                        ) => 128 + signal,
-                    };
-                    let _ = wait_session.finish_remote(exit_code, false).await;
-                }
+                retain_exec_completion(wait_process, wait_session, wait_status).await;
             });
             let handle = ExecHandle {
                 request_id: request_id.to_string(),
@@ -2471,23 +2439,16 @@ mod linux {
             let no_new_privileges = parse_status_decimal(&status, "NoNewPrivs")? == 1;
             // SAFETY: PR_GET_DUMPABLE reads one scalar process property.
             let sandbox_dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) } != 0;
-            let mut core_limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
-            // SAFETY: getrlimit initializes the supplied output value on success.
-            if unsafe { libc::getrlimit(libc::RLIMIT_CORE, core_limit.as_mut_ptr()) } != 0 {
-                return Err(format!(
-                    "read sandbox core limit: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            // SAFETY: successful getrlimit initialized the value.
-            let core_limit = unsafe { core_limit.assume_init() };
+            let (core_current, core_maximum) =
+                nix::sys::resource::getrlimit(nix::sys::resource::Resource::RLIMIT_CORE)
+                    .map_err(|error| format!("read sandbox core limit: {error}"))?;
             let (native_architecture, kernel_release) = uname_values()?;
             let audit = NativeLinuxSandboxAuditEvidence {
                 capabilities,
                 no_new_privileges,
                 sandbox_dumpable,
                 child_dumpable: true,
-                core_limit_zero: core_limit.rlim_cur == 0 && core_limit.rlim_max == 0,
+                core_limit_zero: core_current == 0 && core_maximum == 0,
                 native_architecture,
                 kernel_release,
                 seccomp: self.qualification.seccomp,
@@ -2812,29 +2773,12 @@ mod linux {
     }
 
     fn uname_values() -> Result<(String, String), String> {
-        let mut value = std::mem::MaybeUninit::<libc::utsname>::zeroed();
-        // SAFETY: uname initializes the supplied utsname value on success.
-        if unsafe { libc::uname(value.as_mut_ptr()) } != 0 {
-            return Err(format!(
-                "measure sandbox kernel: {}",
-                io::Error::last_os_error()
-            ));
-        }
-        // SAFETY: successful uname initialized every fixed-size C string.
-        let value = unsafe { value.assume_init() };
-        Ok((c_char_array(&value.machine), c_char_array(&value.release)))
-    }
-
-    fn c_char_array(value: &[libc::c_char]) -> String {
-        let length = value
-            .iter()
-            .position(|byte| *byte == 0)
-            .unwrap_or(value.len());
-        let bytes = value[..length]
-            .iter()
-            .map(|byte| byte.to_ne_bytes()[0])
-            .collect::<Vec<_>>();
-        String::from_utf8_lossy(&bytes).into_owned()
+        let value = nix::sys::utsname::uname()
+            .map_err(|error| format!("measure sandbox kernel identity: {error}"))?;
+        Ok((
+            value.machine().to_string_lossy().into_owned(),
+            value.release().to_string_lossy().into_owned(),
+        ))
     }
 
     impl PreparedBoundary {
@@ -3018,7 +2962,7 @@ mod linux {
     impl ManagedProcess {
         fn spawn(
             runtime: &tokio::runtime::Handle,
-            launcher: &openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+            launcher: &crate::linux::workload_launcher::WorkloadLauncher,
             launch: ManagedProcessLaunch,
             _prepared: PreparedBoundary,
         ) -> Result<Self, String> {
@@ -3475,28 +3419,9 @@ mod linux {
     }
 
     fn reject_workload_unix_peer(stream: &std::os::unix::net::UnixStream) -> io::Result<()> {
-        let mut credentials = libc::ucred {
-            pid: 0,
-            uid: 0,
-            gid: 0,
-        };
-        let mut length =
-            libc::socklen_t::try_from(size_of::<libc::ucred>()).map_err(io::Error::other)?;
-        // SAFETY: both output pointers reference initialized storage of the
-        // declared length, and stream owns the connected Unix descriptor.
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&raw mut credentials).cast(),
-                &raw mut length,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error());
-        }
-        let peer = u32::try_from(credentials.pid)
+        let credentials =
+            nix::sys::socket::getsockopt(stream, nix::sys::socket::sockopt::PeerCredentials)?;
+        let peer = u32::try_from(credentials.pid())
             .map_err(|_| io::Error::from_raw_os_error(libc::EACCES))?;
         // Linux reports PID zero for a peer outside our PID namespace. Such a
         // peer still must authenticate with the per-sandbox mTLS certificate.
@@ -3560,7 +3485,7 @@ mod linux {
         // The private channel directory is driver-provisioned. Requiring the
         // stale inode to have been created by this exact sandbox identity
         // prevents a replacement run from unlinking another principal's path.
-        if metadata.uid() != unsafe { libc::geteuid() } {
+        if metadata.uid() != nix::unistd::geteuid().as_raw() {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 format!(
@@ -3819,6 +3744,52 @@ mod linux {
             generate_sandbox_tls_material,
         };
         use rcgen::{KeyPair, PKCS_ED25519};
+
+        struct FailedWaitProcess;
+
+        #[async_trait::async_trait]
+        impl BoundaryProcess for FailedWaitProcess {
+            async fn wait(
+                &self,
+            ) -> Result<
+                openshell_isolation_interface::contract::BoundaryExitStatus,
+                openshell_isolation_interface::contract::BackendError,
+            > {
+                Err(
+                    openshell_isolation_interface::contract::BackendError::Terminated(
+                        "test boundary loss".to_string(),
+                    ),
+                )
+            }
+
+            async fn signal(
+                &self,
+                _signal: openshell_isolation_interface::contract::BoundarySignal,
+            ) -> Result<(), openshell_isolation_interface::contract::BackendError> {
+                Ok(())
+            }
+
+            async fn terminate(
+                &self,
+            ) -> Result<(), openshell_isolation_interface::contract::BackendError> {
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn exec_wait_failure_records_reclaimable_terminal_status() {
+            let session = MainSession::inert();
+            let mut output = session.subscribe();
+            let status = Arc::new(Mutex::new(None));
+
+            retain_exec_completion(Arc::new(FailedWaitProcess), session, status.clone()).await;
+
+            assert_eq!(*lock(&status), Some(ExitStatusWire::Exited(74)));
+            assert!(matches!(
+                output.recv().await.expect("terminal exec output"),
+                MainOutput::Exit(74)
+            ));
+        }
 
         #[test]
         fn exec_tombstones_expire_without_a_lifetime_limit() {
@@ -4684,11 +4655,10 @@ mod linux {
 
         fn test_network_broker() -> (
             NetworkBroker,
-            openshell_isolation_interface::linux::workload_launcher::WorkloadLauncher,
+            crate::linux::workload_launcher::WorkloadLauncher,
         ) {
             let (launcher, listener) =
-                openshell_isolation_interface::linux::workload_launcher::start()
-                    .expect("start test listener");
+                crate::linux::workload_launcher::start().expect("start test listener");
             (
                 NetworkBroker::start_for_test(listener).expect("start test network broker"),
                 launcher,
@@ -5091,8 +5061,7 @@ mod linux {
         #[tokio::test(flavor = "multi_thread")]
         async fn grpc_server_dispatches_authenticated_logical_streams() {
             let (workload_launcher, listener) =
-                openshell_isolation_interface::linux::workload_launcher::start()
-                    .expect("start multiplexed test listener");
+                crate::linux::workload_launcher::start().expect("start multiplexed test listener");
             let network_broker =
                 NetworkBroker::start_for_test(listener).expect("start multiplexed test broker");
             let (verification_key, token) = test_auth_material("sandbox-multiplexed");

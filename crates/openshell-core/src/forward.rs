@@ -933,6 +933,27 @@ pub fn build_proxy_command(
     )
 }
 
+/// Build the `ssh` options shared by every sandbox session.
+///
+/// Every sandbox is addressed as the host `sandbox`, so a user's `ControlMaster`
+/// or `ControlPath` would reuse one sandbox's connection for another. Command
+/// line options beat `ssh_config`, so connection sharing is turned off here.
+pub fn sandbox_ssh_args(proxy_command: &str, log_level: &str) -> Vec<String> {
+    [
+        format!("ProxyCommand={proxy_command}"),
+        "StrictHostKeyChecking=no".to_string(),
+        "UserKnownHostsFile=/dev/null".to_string(),
+        "GlobalKnownHostsFile=/dev/null".to_string(),
+        format!("LogLevel={log_level}"),
+        "ControlMaster=no".to_string(),
+        "ControlPath=none".to_string(),
+        "ControlPersist=no".to_string(),
+    ]
+    .into_iter()
+    .flat_map(|option| ["-o".to_string(), option])
+    .collect()
+}
+
 /// Error returned when a `CreateSshSessionResponse` fails validation.
 ///
 /// The response fields flow into a `ProxyCommand` string executed by
@@ -1072,37 +1093,7 @@ pub fn build_sandbox_notes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
-        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            let previous = std::env::var_os(key);
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    #[allow(unsafe_code)] // Tests serialize process-wide environment changes with ENV_LOCK.
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.previous {
-                    Some(value) => std::env::set_var(self.key, value),
-                    None => std::env::remove_var(self.key),
-                }
-            }
-        }
-    }
+    use crate::test_environment::Environment;
 
     #[test]
     fn resolve_ssh_gateway_keeps_non_loopback() {
@@ -1357,6 +1348,23 @@ mod tests {
             cmd,
             "/usr/local/bin/openshell ssh-proxy --gateway gw --sandbox sb-123 --workspace workspace-1 --token tok.456 --gateway-name name_1"
         );
+    }
+
+    #[test]
+    fn sandbox_ssh_args_disable_connection_sharing() {
+        let args = sandbox_ssh_args("openshell ssh-proxy", "DEBUG");
+        let options: Vec<&str> = args
+            .chunks(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "-o");
+                pair[1].as_str()
+            })
+            .collect();
+        assert!(options.contains(&"ProxyCommand=openshell ssh-proxy"));
+        assert!(options.contains(&"LogLevel=DEBUG"));
+        for option in ["ControlMaster=no", "ControlPath=none", "ControlPersist=no"] {
+            assert!(options.contains(&option), "missing {option}");
+        }
     }
 
     /// Helper: return the concatenation of characters that appear outside
@@ -1903,16 +1911,17 @@ mod tests {
 
     #[test]
     fn stop_forward_removes_legacy_pid_file_without_signaling() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, "12345").unwrap();
 
-        let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, "12345").unwrap();
-
-        assert!(!stop_forward("default", "sbx-1", 80).unwrap());
-        assert!(!pid_path.exists());
+                assert!(!stop_forward("default", "sbx-1", 80).unwrap());
+                assert!(!pid_path.exists());
+            });
     }
 
     #[test]
@@ -1927,33 +1936,35 @@ mod tests {
 
     #[test]
     fn list_forwards_marks_legacy_pid_records_not_alive() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, "12345").unwrap();
 
-        let pid_path = forward_pid_path("default", "sbx-1", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, "12345").unwrap();
-
-        let forwards = list_forwards().unwrap();
-        assert_eq!(forwards.len(), 1);
-        assert_eq!(forwards[0].workspace, "default");
-        assert_eq!(forwards[0].sandbox_name, "sbx-1");
-        assert_eq!(forwards[0].port, 80);
-        assert!(!forwards[0].validated_alive);
+                let forwards = list_forwards().unwrap();
+                assert_eq!(forwards.len(), 1);
+                assert_eq!(forwards[0].workspace, "default");
+                assert_eq!(forwards[0].sandbox_name, "sbx-1");
+                assert_eq!(forwards[0].port, 80);
+                assert!(!forwards[0].validated_alive);
+            });
     }
 
     #[test]
     fn find_forward_by_port_ignores_legacy_pid_records() {
-        let _lock = ENV_LOCK.lock().unwrap();
         let config_dir = tempfile::tempdir().unwrap();
-        let _xdg_config = EnvVarGuard::set_path("XDG_CONFIG_HOME", config_dir.path());
+        Environment::new()
+            .set("XDG_CONFIG_HOME", config_dir.path())
+            .run(|| {
+                let pid_path = forward_pid_path("default", "old", 80).unwrap();
+                std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
+                std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
 
-        let pid_path = forward_pid_path("default", "old", 80).unwrap();
-        std::fs::create_dir_all(pid_path.parent().unwrap()).unwrap();
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-
-        assert_eq!(find_forward_by_port(80).unwrap(), None);
+                assert_eq!(find_forward_by_port(80).unwrap(), None);
+            });
     }
 
     #[test]

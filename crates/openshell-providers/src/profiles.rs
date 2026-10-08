@@ -93,6 +93,10 @@ pub struct CredentialProfile {
     pub env_vars: Vec<String>,
     #[serde(default)]
     pub required: bool,
+    /// Preserve an issued workload reference across external value updates.
+    /// Requires environment aliases and excludes gateway-owned credentials.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stable_placeholder: bool,
     #[serde(default)]
     pub auth_style: String,
     #[serde(default)]
@@ -813,6 +817,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    stable_placeholder: credential.stable_placeholder,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -991,6 +996,7 @@ impl ProviderTypeProfile {
                     description: credential.description.clone(),
                     env_vars: credential.env_vars.clone(),
                     required: credential.required,
+                    stable_placeholder: credential.stable_placeholder,
                     auth_style: credential.auth_style.clone(),
                     header_name: credential.header_name.clone(),
                     query_param: credential.query_param.clone(),
@@ -1974,7 +1980,31 @@ fn graphql_operation_from_proto(operation: &GraphqlOperation) -> GraphqlOperatio
 }
 
 pub fn parse_profile_yaml(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
-    Ok(serde_yml::from_str::<ProviderTypeProfile>(input)?)
+    Ok(openshell_core::yaml::from_str_with_object_paths::<
+        ProviderTypeProfile,
+    >(
+        input,
+        &[
+            "annotations",
+            "discovery",
+            "credentials.*",
+            "files.*",
+            "endpoints.*",
+            "binaries.*",
+            "credentials.*.refresh.material.*",
+            "credentials.*.refresh.additional_outputs.*",
+            "credentials.*.token_grant.audience_overrides.*",
+            "endpoints.*.mcp",
+            "endpoints.*.graphql_persisted_queries",
+            "endpoints.*.graphql_persisted_queries.*",
+            "endpoints.*.rules.*",
+            "endpoints.*.rules.*.allow.query",
+            "endpoints.*.rules.*.allow.params",
+            "endpoints.*.deny_rules.*",
+            "endpoints.*.deny_rules.*.query",
+            "endpoints.*.deny_rules.*.params",
+        ],
+    )?)
 }
 
 pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileError> {
@@ -1982,7 +2012,7 @@ pub fn parse_profile_json(input: &str) -> Result<ProviderTypeProfile, ProfileErr
 }
 
 pub fn profile_to_yaml(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profile)?)
+    Ok(openshell_core::yaml::to_string(profile)?)
 }
 
 pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileError> {
@@ -1990,7 +2020,7 @@ pub fn profile_to_json(profile: &ProviderTypeProfile) -> Result<String, ProfileE
 }
 
 pub fn profiles_to_yaml(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
-    Ok(serde_yml::to_string(profiles)?)
+    Ok(openshell_core::yaml::to_string(profiles)?)
 }
 
 pub fn profiles_to_json(profiles: &[ProviderTypeProfile]) -> Result<String, ProfileError> {
@@ -2269,7 +2299,44 @@ pub fn validate_profile_set(
         ));
 
         let mut env_vars = HashSet::new();
+        let co_minted_credentials = profile.co_minted_credential_names();
         for credential in &profile.credentials {
+            // Each credential has one placeholder owner. Gateway-managed
+            // credentials derive their handle from a refresh authorization
+            // epoch, including outputs declared by a sibling credential.
+            if credential.stable_placeholder
+                && (credential
+                    .refresh
+                    .as_ref()
+                    .is_some_and(CredentialRefreshProfile::is_gateway_mintable)
+                    || co_minted_credentials.contains(credential.name.as_str()))
+            {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder is incompatible with gateway-managed credential refresh",
+                ));
+            }
+            // Stored-name fallback credentials have no workload environment
+            // reference. Accepting this opt-in would silently leave them in
+            // revision mode because stable delivery selects environment aliases.
+            if credential.stable_placeholder && credential.env_vars.is_empty() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder requires at least one environment variable",
+                ));
+            }
+            if credential.stable_placeholder && credential.token_grant.is_some() {
+                diagnostics.push(ProfileValidationDiagnostic::error(
+                    source,
+                    profile_id,
+                    "credentials.stable_placeholder",
+                    "stable_placeholder is incompatible with token_grant credentials",
+                ));
+            }
             for env_var in &credential.env_vars {
                 if env_var.trim().is_empty() {
                     diagnostics.push(ProfileValidationDiagnostic::error(
@@ -3795,9 +3862,18 @@ credentials:
 
         let exact = ProviderTypeProfile::from_proto(&proto);
         let yaml = profile_to_yaml(&exact).unwrap();
-        assert!(yaml.contains("refresh_before: \"0s\""), "{yaml}");
-        assert!(yaml.contains("max_lifetime: \"1.500s\""), "{yaml}");
-        assert!(yaml.contains("cache_ttl: \"0.500s\""), "{yaml}");
+        // Check string values rather than the emitter's choice of quote style.
+        let document: serde_yml::Value = serde_yml::from_str(&yaml).unwrap();
+        let credential = &document["credentials"][0];
+        assert_eq!(credential["refresh"]["refresh_before"].as_str(), Some("0s"));
+        assert_eq!(
+            credential["refresh"]["max_lifetime"].as_str(),
+            Some("1.500s")
+        );
+        assert_eq!(
+            credential["token_grant"]["cache_ttl"].as_str(),
+            Some("0.500s")
+        );
         assert!(!yaml.contains("refresh_before_seconds"));
         assert!(!yaml.contains("max_lifetime_seconds"));
         assert!(!yaml.contains("cache_ttl_seconds"));
@@ -3811,6 +3887,24 @@ credentials:
             reparsed.credentials[0].token_grant,
             proto.credentials[0].token_grant
         );
+    }
+
+    #[test]
+    fn yaml_profile_rejects_null_objects_and_duplicate_fields() {
+        for field in [
+            "annotations: null",
+            "discovery: null",
+            "endpoints: [null]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {query: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, rules: [{allow: {params: null}}]}]",
+            "endpoints: [{host: example.com, port: 443, graphql_persisted_queries: null}]",
+        ] {
+            let yaml = format!("id: sample\ndisplay_name: Sample\n{field}\n");
+            assert!(parse_profile_yaml(&yaml).is_err(), "{yaml}");
+        }
+        assert!(parse_profile_yaml("id: first\nid: second\ndisplay_name: Sample\n").is_err());
+        // Existing optional fields still accept null as absence.
+        assert!(parse_profile_yaml("id: sample\ndisplay_name: Sample\nendpoints: [{host: example.com, port: 443, rules: [{allow: null}]}]\n").is_ok());
     }
 
     #[test]
@@ -4265,6 +4359,133 @@ credentials:
         assert_eq!(profile.id, "example");
         assert_eq!(profile.category, ProviderProfileCategory::Other);
         assert_eq!(profile.credential_env_vars(), vec!["EXAMPLE_API_KEY"]);
+    }
+
+    #[test]
+    fn stable_placeholder_defaults_false_and_round_trips() {
+        let default_profile = parse_profile_yaml(
+            r"
+id: default-placeholder
+display_name: Default Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+",
+        )
+        .expect("profile should parse");
+        assert!(!default_profile.credentials[0].stable_placeholder);
+
+        let stable_profile = parse_profile_yaml(
+            r"
+id: stable-placeholder
+display_name: Stable Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+",
+        )
+        .expect("profile should parse");
+        assert!(stable_profile.credentials[0].stable_placeholder);
+
+        let proto = stable_profile.to_proto();
+        assert!(proto.credentials[0].stable_placeholder);
+        let round_trip = ProviderTypeProfile::from_proto(&proto);
+        assert!(round_trip.credentials[0].stable_placeholder);
+
+        let exported = profile_to_yaml(&round_trip).expect("yaml");
+        assert!(exported.contains("stable_placeholder: true"));
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_co_minted_refresh_outputs() {
+        for id in ["aws", "aws-s3"] {
+            for output in ["secret_access_key", "session_token"] {
+                let mut profile = crate::example_profiles::load(id);
+                let credential = profile
+                    .credentials
+                    .iter_mut()
+                    .find(|credential| credential.name == output)
+                    .expect("example profile refresh output");
+                assert!(credential.refresh.is_none());
+                credential.stable_placeholder = true;
+                let diagnostics = validate_profile_set(&[(format!("{id}.yaml"), profile)]);
+                assert!(diagnostics.iter().any(|diagnostic| {
+                    diagnostic.field == "credentials.stable_placeholder"
+                        && diagnostic.message
+                            == "stable_placeholder is incompatible with gateway-managed credential refresh"
+                }));
+            }
+        }
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_credentials_without_environment_aliases() {
+        let profile = parse_profile_yaml(
+            r"
+id: stored-name-placeholder
+display_name: Stored Name Placeholder
+credentials:
+  - name: TOKEN
+    stable_placeholder: true
+",
+        )
+        .expect("stored-name profile should parse");
+        assert_eq!(profile.credentials[0].accepted_stored_keys(), vec!["TOKEN"]);
+        let diagnostics = validate_profile_set(&[("stored-name.yaml".to_string(), profile)]);
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder requires at least one environment variable"
+        }));
+    }
+
+    #[test]
+    fn stable_placeholder_rejects_runtime_minted_credentials() {
+        let refresh_profile = parse_profile_yaml(
+            r"
+id: refresh-placeholder
+display_name: Refresh Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+    refresh:
+      strategy: oauth2_refresh_token
+      token_url: https://auth.example.com/token
+",
+        )
+        .expect("refresh profile should parse");
+        let refresh_diagnostics =
+            validate_profile_set(&[("refresh.yaml".to_string(), refresh_profile)]);
+        assert!(refresh_diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder is incompatible with gateway-managed credential refresh"
+        }));
+
+        let token_grant_profile = parse_profile_yaml(
+            r"
+id: token-grant-placeholder
+display_name: Token Grant Placeholder
+credentials:
+  - name: token
+    env_vars: [TOKEN]
+    stable_placeholder: true
+    auth_style: bearer
+    header_name: Authorization
+    token_grant:
+      token_endpoint: https://auth.example.com/token
+",
+        )
+        .expect("token grant profile should parse");
+        let token_grant_diagnostics =
+            validate_profile_set(&[("token-grant.yaml".to_string(), token_grant_profile)]);
+        assert!(token_grant_diagnostics.iter().any(|diagnostic| {
+            diagnostic.field == "credentials.stable_placeholder"
+                && diagnostic.message
+                    == "stable_placeholder is incompatible with token_grant credentials"
+        }));
     }
 
     #[test]
