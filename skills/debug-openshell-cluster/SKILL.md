@@ -514,7 +514,9 @@ operations per replica hold or wait for PostgreSQL locks at once.
 `openshell_server_mutation_lock_connections_in_use` shows how many are checked
 out, against `openshell_server_mutation_lock_connections_capacity`. Its data
 pool (`server.dbMaxConnections`, `database_max_connections`, 10 by default) is
-separate. The gateway logs both sizes at startup in
+separate. Helm values in the `openshell.gateway` table under `gatewayConfig`
+override the compatibility settings `server.dbMaxConnections` and
+`server.dbLockMaxConnections`. The gateway logs both sizes at startup in
 `sizing Postgres connection pools`. A request cancelled during its lock wait
 frees its slot while its backend keeps waiting, with any keys it took, until
 the 10-second deadline, so `pg_locks` can briefly show more lock sessions from

@@ -118,12 +118,12 @@ Top-level lists represent TOML arrays of tables and preserve their YAML order. *
 {{- if and (gt $dbMaxConnections 0) (not (hasKey $gateway "database_max_connections")) -}}
 {{- $_ := set $gateway "database_max_connections" $dbMaxConnections -}}
 {{- end -}}
-{{- $mutationLockPoolMaxConnections := int (get $legacyServer "mutationLockPoolMaxConnections") -}}
-{{- if lt $mutationLockPoolMaxConnections 0 -}}
-{{- fail "server.mutationLockPoolMaxConnections must not be negative; set 0 to use the gateway default" -}}
+{{- $dbLockMaxConnections := int (get $legacyServer "dbLockMaxConnections") -}}
+{{- if lt $dbLockMaxConnections 0 -}}
+{{- fail "server.dbLockMaxConnections must not be negative; set 0 to use the gateway default" -}}
 {{- end -}}
-{{- if and (gt $mutationLockPoolMaxConnections 0) (not (hasKey $gateway "mutation_lock_pool_max_connections")) -}}
-{{- $_ := set $gateway "mutation_lock_pool_max_connections" $mutationLockPoolMaxConnections -}}
+{{- if and (gt $dbLockMaxConnections 0) (not (hasKey $gateway "database_lock_max_connections")) -}}
+{{- $_ := set $gateway "database_lock_max_connections" $dbLockMaxConnections -}}
 {{- end -}}
 {{- $serverDnsNames := .Values.pkiInitJob.serverDnsNames | default list -}}
 {{- if .Values.certManager.enabled -}}{{- $serverDnsNames = .Values.certManager.serverDnsNames | default list -}}{{- end -}}

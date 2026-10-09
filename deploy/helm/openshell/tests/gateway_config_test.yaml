@@ -870,6 +870,23 @@ tests:
       - failedTemplate:
           errorMessage: "server.dbLockMaxConnections must not be negative; set 0 to use the gateway default"
 
+  - it: lets gatewayConfig override both legacy pool ceilings
+    template: templates/gateway-config.yaml
+    set:
+      server.dbMaxConnections: 64
+      server.dbLockMaxConnections: 8
+      gatewayConfig:
+        openshell.gateway:
+          database_max_connections: 32
+          database_lock_max_connections: 6
+    asserts:
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?database_max_connections\s*=\s*32'
+      - matchRegex:
+          path: data["gateway.toml"]
+          pattern: '(?ms)\[openshell\.gateway\][^\[]*?database_lock_max_connections\s*=\s*6'
+
   - it: uses the configured existing sandbox service account name
     template: templates/gateway-config.yaml
     set:
