@@ -217,6 +217,10 @@ pub struct SshIdentityMutationGuard {
     _order: lock_order::Held,
 }
 
+pub struct RefreshMutationGuard {
+    _postgres: Option<postgres::PostgresDataPoolLockGuard>,
+}
+
 #[cfg(test)]
 impl DistributedMutationGuard {
     /// Backend process id of the `PostgreSQL` session holding the locks, or
@@ -373,7 +377,7 @@ impl Store {
         &self,
         provider_id: &str,
         credential_key: &str,
-    ) -> PersistenceResult<DistributedMutationGuard> {
+    ) -> PersistenceResult<RefreshMutationGuard> {
         use sha2::{Digest, Sha256};
         let mut digest = Sha256::new();
         digest.update(b"openshell-provider-refresh-lock-v1\0");
@@ -383,10 +387,10 @@ impl Store {
         let hash = digest.finalize();
         let key = i64::from_be_bytes(hash[..8].try_into().expect("eight digest bytes"));
         match self {
-            Self::Postgres(store) => Ok(DistributedMutationGuard {
-                _postgres: Some(store.acquire_mutation_lock(key).await?),
+            Self::Postgres(store) => Ok(RefreshMutationGuard {
+                _postgres: Some(store.acquire_data_pool_lock(key).await?),
             }),
-            Self::Sqlite(_) => Ok(DistributedMutationGuard { _postgres: None }),
+            Self::Sqlite(_) => Ok(RefreshMutationGuard { _postgres: None }),
         }
     }
 
