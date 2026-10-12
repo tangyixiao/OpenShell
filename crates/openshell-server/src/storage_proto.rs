@@ -146,10 +146,10 @@ mod tests {
     // Legacy payloads decode empty owners; the gateway rebuilds their authority
     // from effective policy rather than trusting persisted owner stamps.
     // Operator credential export adds four public messages and no durable types.
-    // Sandbox service route snapshots add one public-only message. They reuse
+    // Sandbox service route snapshots and advertisements add public-only messages. They reuse
     // existing durable ServiceEndpoint declarations without a storage change.
     const PUBLIC_RPC_SCHEMA_SHA256: &str =
-        "5ae8334d9f6212a00c38ba965ff62e567d2846b15f4df8faf85954023da542e7";
+        "f975ba80d19bd1ca61cd71679a58979ead1215b613d83e4edb765d1f2180a079";
     const DURABLE_SCHEMA_SHA256: &str =
         "5281143e2825539af6148785c91f9df67f654eb74d215f57940af9314867a55f";
     const PUBLIC_DURABLE_OVERLAP_SHA256: &str =
@@ -621,7 +621,7 @@ mod tests {
                 overlap_hash.as_str(),
             ),
             (
-                (312, 27),
+                (313, 27),
                 (93, 21),
                 (81, 21),
                 PUBLIC_RPC_SCHEMA_SHA256,

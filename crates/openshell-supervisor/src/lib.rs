@@ -1312,6 +1312,7 @@ async fn run_sandbox_with_backend(
                 sandbox.clone().unwrap_or_default(),
                 workspace_rx.clone(),
                 running.loopback_connector(),
+                boundary_access.service_advertisement_sender(),
             )
         });
         let instance_id = boundary_access.instance_id().to_string();
