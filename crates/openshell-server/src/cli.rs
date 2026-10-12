@@ -3180,139 +3180,133 @@ grpc_rate_limit_window_seconds = 30
 
     #[test]
     fn file_db_max_connections_populates_args_when_cli_omits() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvVarGuard::remove("OPENSHELL_DB_MAX_CONNECTIONS");
-
-        let (mut args, matches) =
-            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
-        assert_eq!(
-            args.db_max_connections, None,
-            "default leaves the pool alone"
-        );
-        let file = config_file_from_toml(
-            r"
+        Environment::new()
+            .remove("OPENSHELL_DB_MAX_CONNECTIONS")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                assert_eq!(
+                    args.db_max_connections, None,
+                    "default leaves the pool alone"
+                );
+                let file = config_file_from_toml(
+                    r"
 [openshell.gateway]
 database_max_connections = 64
 ",
-        );
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
-        assert_eq!(args.db_max_connections, Some(64));
+                assert_eq!(args.db_max_connections, Some(64));
+            });
     }
 
     #[test]
     fn env_db_max_connections_overrides_file_value() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvVarGuard::set("OPENSHELL_DB_MAX_CONNECTIONS", "128");
-
-        let (mut args, matches) =
-            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
-        let file = config_file_from_toml(
-            r"
+        Environment::new()
+            .set("OPENSHELL_DB_MAX_CONNECTIONS", "128")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    r"
 [openshell.gateway]
 database_max_connections = 64
 ",
-        );
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
-        assert_eq!(args.db_max_connections, Some(128));
+                assert_eq!(args.db_max_connections, Some(128));
+            });
     }
 
     #[test]
     fn db_max_connections_rejects_a_zero_or_unparseable_ceiling() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvVarGuard::remove("OPENSHELL_DB_MAX_CONNECTIONS");
-
-        // Zero would deadlock every `acquire`, and a silent fallback to the
-        // default would reproduce the ceiling the operator is trying to lift.
-        for bad in ["0", "-5", "many"] {
-            assert!(
-                command()
-                    .try_get_matches_from([
-                        "openshell-gateway",
-                        "--db-url",
-                        "sqlite::memory:",
-                        "--db-max-connections",
-                        bad,
-                    ])
-                    .is_err(),
-                "input {bad:?} must be rejected"
-            );
-        }
+        Environment::new()
+            .remove("OPENSHELL_DB_MAX_CONNECTIONS")
+            .run(|| {
+                // Zero would deadlock every `acquire`, and a silent fallback to the
+                // default would reproduce the ceiling the operator is trying to lift.
+                for bad in ["0", "-5", "many"] {
+                    assert!(
+                        command()
+                            .try_get_matches_from([
+                                "openshell-gateway",
+                                "--db-url",
+                                "sqlite::memory:",
+                                "--db-max-connections",
+                                bad,
+                            ])
+                            .is_err(),
+                        "input {bad:?} must be rejected"
+                    );
+                }
+            });
     }
 
     #[test]
     fn file_db_lock_max_connections_populates_args_when_cli_omits() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvVarGuard::remove("OPENSHELL_DB_LOCK_MAX_CONNECTIONS");
-
-        let (mut args, matches) =
-            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
-        assert_eq!(
-            args.db_lock_max_connections, None,
-            "default leaves the lock pool alone"
-        );
-        let file = config_file_from_toml(
-            r"
+        Environment::new()
+            .remove("OPENSHELL_DB_LOCK_MAX_CONNECTIONS")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                assert_eq!(
+                    args.db_lock_max_connections, None,
+                    "default leaves the lock pool alone"
+                );
+                let file = config_file_from_toml(
+                    r"
 [openshell.gateway]
 database_lock_max_connections = 8
 ",
-        );
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
-        assert_eq!(args.db_lock_max_connections, Some(8));
+                assert_eq!(args.db_lock_max_connections, Some(8));
+            });
     }
 
     #[test]
     fn env_db_lock_max_connections_overrides_file_value() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvVarGuard::set("OPENSHELL_DB_LOCK_MAX_CONNECTIONS", "16");
-
-        let (mut args, matches) =
-            parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
-        let file = config_file_from_toml(
-            r"
+        Environment::new()
+            .set("OPENSHELL_DB_LOCK_MAX_CONNECTIONS", "16")
+            .run(|| {
+                let (mut args, matches) =
+                    parse_with_args(&["openshell-gateway", "--db-url", "sqlite::memory:"]);
+                let file = config_file_from_toml(
+                    r"
 [openshell.gateway]
 database_lock_max_connections = 8
 ",
-        );
-        merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
+                );
+                merge_file_into_args(&mut args, &file.openshell.gateway, &matches);
 
-        assert_eq!(args.db_lock_max_connections, Some(16));
+                assert_eq!(args.db_lock_max_connections, Some(16));
+            });
     }
 
     #[test]
     fn db_lock_max_connections_rejects_a_zero_or_unparseable_ceiling() {
-        let _lock = ENV_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _g = EnvVarGuard::remove("OPENSHELL_DB_LOCK_MAX_CONNECTIONS");
-
-        // A zero-sized lock pool would time out every guarded mutation.
-        for bad in ["0", "-5", "many"] {
-            assert!(
-                command()
-                    .try_get_matches_from([
-                        "openshell-gateway",
-                        "--db-url",
-                        "sqlite::memory:",
-                        "--db-lock-max-connections",
-                        bad,
-                    ])
-                    .is_err(),
-                "input {bad:?} must be rejected"
-            );
-        }
+        Environment::new()
+            .remove("OPENSHELL_DB_LOCK_MAX_CONNECTIONS")
+            .run(|| {
+                // A zero-sized lock pool would time out every guarded mutation.
+                for bad in ["0", "-5", "many"] {
+                    assert!(
+                        command()
+                            .try_get_matches_from([
+                                "openshell-gateway",
+                                "--db-url",
+                                "sqlite::memory:",
+                                "--db-lock-max-connections",
+                                bad,
+                            ])
+                            .is_err(),
+                        "input {bad:?} must be rejected"
+                    );
+                }
+            });
     }
 
     #[test]
