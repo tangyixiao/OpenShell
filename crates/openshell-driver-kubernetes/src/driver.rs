@@ -2456,6 +2456,7 @@ impl KubernetesComputeDriver {
                     ),
                     dependent_owner.clone(),
                     &self.supervisor_tracing_environment(),
+                    self.config.sandbox_runtime.app_listener.as_ref(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
@@ -3278,6 +3279,7 @@ impl KubernetesComputeDriver {
                         false,
                     ),
                     &self.supervisor_tracing_environment(),
+                    self.config.sandbox_runtime.app_listener.as_ref(),
                 )
                 .map_err(KubernetesDriverError::Message)?,
             )
